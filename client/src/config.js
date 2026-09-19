@@ -5,8 +5,8 @@ const config = {
     SOCKET_URL: 'http://localhost:5001'
   },
   production: {
-    API_BASE: 'https://lgt-2.onrender.com/api',
-    SOCKET_URL: 'https://lgt-2.onrender.com'
+    API_BASE: '${URL}/api',
+    SOCKET_URL: '${URL}'
   }
 };
 

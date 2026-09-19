@@ -15,7 +15,7 @@ const app = express();
 const ALLOWED_ORIGINS = [
   'http://localhost:3000',
   'http://localhost:3001',
-  'https://vcclient.nerdlab.co.in',
+  '${client_url}',
   'https://video-meet-client.onrender.com',
   'https://video-meet-aj54.onrender.com',
   'https://lgt-2.onrender.com',
