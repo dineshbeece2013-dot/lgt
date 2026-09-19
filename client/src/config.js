@@ -12,8 +12,18 @@ const config = {
 
 // Determine current environment
 // Only treat true localhost as development — ngrok/deployed URLs use production backend
-const isLocalhost = window.location.hostname === 'localhost' || 
+const isLocalhost = window.location.hostname === 'localhost' ||
                    window.location.hostname === '127.0.0.1';
+
+// Allow overriding via build-time env var (used by Docker / CI builds).
+// e.g. REACT_APP_SIGNALING_SERVER=http://192.168.1.10:5001 npm run build
+const envSocketUrl = process.env.REACT_APP_SIGNALING_SERVER;
+if (envSocketUrl) {
+  config.development.SOCKET_URL = envSocketUrl;
+  config.development.API_BASE = `${envSocketUrl.replace(/\/$/, '')}/api`;
+  config.production.SOCKET_URL = envSocketUrl;
+  config.production.API_BASE = `${envSocketUrl.replace(/\/$/, '')}/api`;
+}
 
 const environment = isLocalhost ? 'development' : 'production';
 

@@ -1,304 +1,139 @@
-# Video Meet with Translation - Architecture
+# VideoMeet Pro — Architecture
 
-## System Architecture
+Full-stack video conferencing with **100% browser-native live translation**.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         CLIENT (React)                          │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐        │
-│  │   Home.js    │  │ CreateRoom   │  │  JoinRoom    │        │
-│  │              │  │              │  │              │        │
-│  │ - Room List  │  │ - Form       │  │ - Form       │        │
-│  │ - Navigation │  │ - Language   │  │ - Language   │        │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘        │
-│         │                 │                  │                 │
-│         └─────────────────┴──────────────────┘                 │
-│                           │                                     │
-│                           ▼                                     │
-│                  ┌─────────────────┐                           │
-│                  │  VideoCall.js   │                           │
-│                  ├─────────────────┤                           │
-│                  │ - WebRTC        │                           │
-│                  │ - Video/Audio   │                           │
-│                  │ - Translation   │◄──┐                       │
-│                  │ - Chat          │   │                       │
-│                  │ - Controls      │   │                       │
-│                  └────────┬────────┘   │                       │
-│                           │            │                       │
-│                  ┌────────▼────────┐   │                       │
-│                  │ LanguageSelector│   │                       │
-│                  │                 │   │                       │
-│                  │ - 15 Languages  │   │                       │
-│                  │ - Dropdown UI   │   │                       │
-│                  └─────────────────┘   │                       │
-│                                        │                       │
-└────────────────────────────────────────┼───────────────────────┘
-                                         │
-                                         │ Socket.io
-                                         │ WebRTC Signaling
-                                         │ Audio Data
-                                         │
-┌────────────────────────────────────────▼───────────────────────┐
-│                      SERVER (Node.js)                          │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌──────────────────────────────────────────────────────────┐ │
-│  │                    index.js (Main Server)                 │ │
-│  ├──────────────────────────────────────────────────────────┤ │
-│  │                                                           │ │
-│  │  ┌─────────────────┐  ┌─────────────────┐              │ │
-│  │  │  Socket.io      │  │  Express API    │              │ │
-│  │  │  Events         │  │  Endpoints      │              │ │
-│  │  ├─────────────────┤  ├─────────────────┤              │ │
-│  │  │ - join-room     │  │ - POST /rooms   │              │ │
-│  │  │ - send-audio    │  │ - GET /rooms    │              │ │
-│  │  │ - offer/answer  │  │ - POST /verify  │              │ │
-│  │  │ - ice-candidate │  │                 │              │ │
-│  │  │ - chat          │  │                 │              │ │
-│  │  └────────┬────────┘  └─────────────────┘              │ │
-│  │           │                                             │ │
-│  │           ▼                                             │ │
-│  │  ┌─────────────────────────────────┐                   │ │
-│  │  │   Audio Processing Handler      │                   │ │
-│  │  ├─────────────────────────────────┤                   │ │
-│  │  │ 1. Receive base64 audio         │                   │ │
-│  │  │ 2. Convert to WAV file          │                   │ │
-│  │  │ 3. Send to OpenAI Whisper       │◄──────┐          │ │
-│  │  │ 4. Get transcription            │       │          │ │
-│  │  │ 5. Send to GPT-4o-mini          │◄──────┤          │ │
-│  │  │ 6. Get translation              │       │          │ │
-│  │  │ 7. Return to client             │       │          │ │
-│  │  └─────────────────────────────────┘       │          │ │
-│  │                                             │          │ │
-│  └─────────────────────────────────────────────┼──────────┘ │
-│                                                │            │
-└────────────────────────────────────────────────┼────────────┘
-                                                 │
-                                                 │ HTTPS API
-                                                 │
-┌────────────────────────────────────────────────▼────────────────┐
-│                         OpenAI API                              │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌──────────────────────┐      ┌──────────────────────┐       │
-│  │   Whisper Model      │      │   GPT-4o-mini        │       │
-│  │   (Speech-to-Text)   │      │   (Translation)      │       │
-│  ├──────────────────────┤      ├──────────────────────┤       │
-│  │ Input: Audio (WAV)   │      │ Input: Text          │       │
-│  │ Output: Text         │──────►│ Output: Translated   │       │
-│  │                      │      │         Text         │       │
-│  └──────────────────────┘      └──────────────────────┘       │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+- **Speech-to-text:** Web Speech API (`SpeechRecognition`) — built into Chrome, Edge, Safari
+- **Translation:** Chrome built-in **on-device Translator API** — runs locally, no network calls
+- **Text-to-speech:** browser `SpeechSynthesis`
+- **Server:** signaling + room management + transcript relay only — **no AI on the server, no API keys**
 
-## Data Flow: Voice Translation
-
-### Step-by-Step Process
+## System Overview
 
 ```
-1. USER SPEAKS
-   │
-   ├─► Browser captures audio via MediaRecorder
-   │   (WebM format, 10 seconds max)
-   │
-   ▼
-2. AUDIO ENCODING
-   │
-   ├─► Convert audio blob to Base64 string
-   │
-   ▼
-3. SEND TO SERVER
-   │
-   ├─► Socket.io emit 'send-audio' event
-   │   Payload: { audio: base64String, targetLanguage: 'es' }
-   │
-   ▼
-4. SERVER PROCESSING
-   │
-   ├─► Decode Base64 to Buffer
-   ├─► Write to temporary WAV file
-   │
-   ▼
-5. WHISPER TRANSCRIPTION
-   │
-   ├─► Send WAV file to OpenAI Whisper API
-   ├─► Receive transcribed text
-   │   Example: "Hello, how are you?"
-   │
-   ▼
-6. GPT TRANSLATION
-   │
-   ├─► Send text to GPT-4o-mini with prompt:
-   │   "Translate this to Spanish: Hello, how are you?"
-   ├─► Receive translated text
-   │   Example: "Hola, ¿cómo estás?"
-   │
-   ▼
-7. RETURN TO CLIENT
-   │
-   ├─► Socket.io emit 'transcription-result'
-   │   Payload: {
-   │     original: "Hello, how are you?",
-   │     translated: "Hola, ¿cómo estás?",
-   │     targetLanguage: "es",
-   │     targetLanguageName: "Spanish"
-   │   }
-   │
-   ▼
-8. DISPLAY RESULTS
-   │
-   └─► Update UI with translation
-       Show in Translations panel
+┌────────────────────────────┐        ┌────────────────────────────┐
+│      SPEAKER'S BROWSER      │       │     LISTENER'S BROWSER     │
+│  ┌───────────────────────┐ │        │  ┌───────────────────────┐ │
+│  │ Web Speech API        │ │        │  │ participant-translation│ │
+│  │ (SpeechRecognition)   │ │        │  │ → show caption card    │ │
+│  │  → final transcript   │ │        │  │ → TTS via SpeechSynthesis│
+│  └──────────┬────────────┘ │        │  └───────────▲───────────┘ │
+│             ▼              │        │              │             │
+│  ┌───────────────────────┐ │        │              │             │
+│  │ Chrome on-device      │ │        │              │             │
+│  │ Translator API        │ │        │              │             │
+│  │ (one translate call   │ │        │              │             │
+│  │  per target language) │ │        │              │             │
+│  └──────────┬────────────┘ │        │              │             │
+└─────────────┼──────────────┘        └──────────────┼─────────────┘
+              │ transcript-broadcast                  │ participant-translation
+              │ {original, translations{lang:text}}   │ (per-listener language)
+              ▼                                       ▲
+   ┌────────────────────────────────────────────────────────────┐
+   │                SERVER (Node.js + Socket.IO)                 │
+   │  • Rooms, passcodes, admin roles (REST + sockets)           │
+   │  • WebRTC signaling (offer/answer/ICE relay)                │
+   │  • transcript-broadcast → fans out per-participant language │
+   │  • Whiteboard / chat / reactions relay                      │
+   │  • No AI, no audio processing, no API keys                  │
+   └────────────────────────────────────────────────────────────┘
 ```
+
+## Data Flow: Live Translation
+
+1. **User speaks** — the browser's `SpeechRecognition` (continuous mode, `lang` = speaker's language) produces interim + final results. It auto-restarts after silence.
+2. **Final transcript** — the speaker's client collects every target language in the room (its own + each other participant's `translationLanguage`, via the `participants` list).
+3. **On-device translation** — for each unique target language, the client calls the Chrome built-in `Translator` API (instances cached per language pair). If a pair is unavailable, the original transcript is delivered as a fallback.
+4. **Broadcast** — one `transcript-broadcast` event is emitted with `{ original, translations: { lang: text }, speakerName, speakerLanguage }`.
+5. **Server relay** — the server looks up the room and emits `participant-translation` to every *other* participant with the translation in *their* language. The speaker already shows their own transcript locally.
+6. **Display + speak** — listeners show the caption card in the Translations panel and speak it via `SpeechSynthesis` (queued; TTS can be toggled).
+
+> WebRTC media (video/audio) flows peer-to-peer and is never relayed through the translation pipeline.
 
 ## Component Hierarchy
 
 ```
 App.js
-│
-├─── Home.js
-│    └─── (Navigation to Create/Join)
-│
-├─── CreateRoom.js
-│    └─── LanguageSelector.js
-│
-├─── JoinRoom.js
-│    └─── LanguageSelector.js
-│
+├─── Home.js            (room list, live status via sockets)
+├─── CreateRoom.js      └── LanguageSelector.js
+├─── JoinRoom.js        └── LanguageSelector.js
+├─── MeetingHistory.js  (localStorage: past meetings + recordings)
 └─── VideoCall.js
-     ├─── RemoteVideo (component)
-     ├─── Chat Panel
-     ├─── People Panel
-     ├─── Recordings Panel
-     └─── Translations Panel ⭐ NEW
-          ├─── Transcription Items
-          └─── Clear Button
+     ├─── RemoteVideo, Chat Panel, People Panel, Recordings Panel
+     ├─── Whiteboard.js (collaborative, socket-synced)
+     └─── Translations Panel
+          ├─── transcript cards (original + translated)
+          ├─── language selectors (speak / hear)
+          └─── TTS + auto-translate toggles
 ```
 
-## State Management
+## State (VideoCall.js)
 
-### VideoCall Component State
+```
+// Translation (browser-native)
+- translationEnabled          auto-translate on/off
+- translationLanguage         language the user wants to hear
+- speakerLanguage             language the user speaks (drives recognition.lang)
+- transcriptionResults[]      transcript cards (max 50)
+- showTranscriptions          panel visibility
+- translationStatus           live status / interim text
 
-```javascript
-// Video/Audio State
-- localStream
-- remoteStreams (Map)
-- isVideoEnabled
-- isAudioEnabled
-- isScreenSharing
-
-// Translation State ⭐ NEW
-- translationEnabled
-- translationLanguage (from route state)
-- isTranslating
-- transcriptionResults (array)
-- showTranscriptions
-- audioRecorder
-- isCapturingAudio
-
-// Room State
-- participants
-- roomInfo
-- isAdmin
-- participantCount
-
-// UI State
-- showChat
-- showPeople
-- showRecordings
-- showTranscriptions ⭐ NEW
+// Refs (avoid stale closures in recognizer events)
+- recognitionRef              active SpeechRecognition instance
+- speechActiveRef             auto-restart flag
+- translatorCacheRef          Map "src>dst" → Translator instance
+- participantsRef / translationLanguageRef / handleFinalTranscriptRef
 ```
 
-## API Endpoints
+## API Endpoints (Express)
 
-### REST API (Express)
 ```
-POST   /api/rooms              - Create new room
-GET    /api/rooms              - List all rooms
-POST   /api/rooms/:id/verify   - Verify room passcode
-```
-
-### Socket.io Events
-
-#### Client → Server
-```
-join-room              - Join a video room
-send-audio ⭐ NEW      - Send audio for translation
-offer                  - WebRTC offer
-answer                 - WebRTC answer
-ice-candidate          - ICE candidate
-send-chat-message      - Send chat message
-toggle-video           - Toggle video on/off
-toggle-audio           - Toggle audio on/off
-toggle-raise-hand      - Raise/lower hand
-send-reaction          - Send emoji reaction
-admin-remove-participant - Remove user (admin only)
-admin-end-meeting      - End meeting (admin only)
+GET    /health                  - health check (status, rooms, uptime)
+POST   /api/rooms               - create room
+GET    /api/rooms               - list rooms
+POST   /api/rooms/:id/verify    - verify passcode + schedule
 ```
 
-#### Server → Client
+## Socket.io Events (translation-related)
+
 ```
-room-joined            - Successfully joined room
-transcription-result ⭐ NEW - Translation result
-transcription-error ⭐ NEW  - Translation error
-user-joined            - New user joined
-user-left              - User left
-offer                  - WebRTC offer
-answer                 - WebRTC answer
-ice-candidate          - ICE candidate
-new-chat-message       - New chat message
-new-reaction           - New emoji reaction
-participant-removed    - User was removed
-meeting-ended          - Meeting ended by host
-force-disconnect       - Forced disconnect
+Client → Server
+transcript-broadcast     speaker's transcript + translations map (relay only)
+update-language          change speaker/translation language mid-meeting
+
+Server → Client
+participant-translation  { original, translated, targetLanguage, targetLanguageName, speakerName }
+room-joined / user-joined / user-left / room-active / room-deleted
+offer / answer / ice-candidate / media-state (WebRTC signaling)
+new-chat-message / new-reaction / whiteboard-* / admin events
 ```
 
 ## Technology Stack
 
-### Frontend
-- React 19.2.3
-- React Router 6.30.2
-- Socket.io Client 4.8.3
-- WebRTC APIs
-- MediaRecorder API
+- **Frontend:** React 19, React Router 6, Socket.IO Client 4, WebRTC, Web Speech API, Chrome built-in Translator API, @jitsi/rnnoise-wasm (AudioWorklet noise suppression)
+- **Backend:** Node.js (ESM), Express 5, Socket.IO 4, dotenv — no AI/SDK dependencies
 
-### Backend
-- Node.js with ES Modules
-- Express 5.2.1
-- Socket.io 4.8.3
-- OpenAI SDK 6.25.0
-- dotenv 17.3.1
+## Security & Privacy
 
-### APIs
-- OpenAI Whisper (Speech-to-Text)
-- OpenAI GPT-4o-mini (Translation)
+1. **No API keys** — nothing to leak or rotate; the server has no credentials.
+2. **Audio never leaves the device** — speech recognition and translation run locally in each browser; only text transcripts are relayed.
+3. **Room access** — passcode + optional schedule gating; admin-only removal/meeting-end.
+4. **Room persistence** — rooms cached to a temp JSON file to survive restarts on free hosting.
 
-## Security Considerations
+## Browser Support Matrix
 
-1. **API Key Protection**: OpenAI key stored in .env file
-2. **Room Access**: Passcode required to join rooms
-3. **Admin Controls**: Only host can remove users or end meeting
-4. **Audio Privacy**: Audio processed server-side, not stored permanently
-5. **Temporary Files**: Audio files deleted after processing
+| Capability | Chrome/Edge | Safari | Firefox |
+|---|---|---|---|
+| Video/audio calls | ✅ | ✅ | ✅ |
+| Speech recognition (captions) | ✅ | ✅* | ❌ |
+| On-device translation | ✅ 138+ | ❌ (falls back to original text) | ❌ |
+| Text-to-speech | ✅ | ✅ | ✅ |
 
-## Performance Optimizations
-
-1. **Audio Chunking**: 10-second audio segments
-2. **Lazy Loading**: Translation panel only loads when needed
-3. **Efficient State Updates**: React.memo for RemoteVideo component
-4. **Connection Pooling**: Reuse socket connections
-5. **ICE Candidate Optimization**: Multiple STUN/TURN servers
+\* Safari's speech recognition support is limited; Chrome/Edge recommended.
 
 ## Future Enhancements
 
-- [ ] Continuous real-time translation (streaming)
-- [ ] Multiple simultaneous language support
+- [ ] Fallback translation provider for browsers without the built-in Translator
+- [ ] Automatic language detection (`LanguageDetector` API) instead of explicit speaker language
 - [ ] Translation history export (PDF/CSV)
-- [ ] Voice synthesis for translated text (Text-to-Speech)
-- [ ] Automatic language detection
-- [ ] Translation confidence scores
-- [ ] Offline translation caching
-- [ ] Custom vocabulary/terminology support
+- [ ] On-device translation model pre-download prompt before meetings
+

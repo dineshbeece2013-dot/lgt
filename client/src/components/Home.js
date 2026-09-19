@@ -6,9 +6,6 @@ import useScrollReveal from '../hooks/useScrollReveal';
 import useRipple from '../hooks/useRipple';
 import './Home.css';
 
-// Import test for configuration verification
-import '../test-config';
-
 // Returns true if the meeting is currently joinable (within 5 min before start or already started)
 function isMeetingJoinable(event) {
   if (event.isActive) return true;

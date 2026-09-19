@@ -4,17 +4,17 @@ services:
   server:
     build: ./server
     ports:
-      - "10000:10000"
+      - "5001:5001"
     environment:
       - NODE_ENV=production
-      - GROQ_API_KEY=${GROQ_API_KEY}
+      - PORT=5001
     restart: unless-stopped
 
   client:
     build:
       context: ./client
       args:
-        REACT_APP_SIGNALING_SERVER: ${REACT_APP_SIGNALING_SERVER:-http://localhost:10000}
+        REACT_APP_SIGNALING_SERVER: ${REACT_APP_SIGNALING_SERVER:-http://localhost:5001}
     ports:
       - "3000:80"
     depends_on:

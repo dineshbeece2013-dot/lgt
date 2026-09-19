@@ -3,7 +3,6 @@ import http from "http";
 import { Server } from "socket.io";
 import cors from "cors";
 import dotenv from "dotenv";
-import Groq from "groq-sdk";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -61,32 +60,8 @@ const io = new Server(server, {
   maxHttpBufferSize: 10 * 1024 * 1024 // 10MB
 });
 
-// Initialize Groq
-let groq = null;
-if (!process.env.GROQ_API_KEY) {
-  console.error('❌ GROQ_API_KEY is not set! Translation will not work.');
-} else {
-  console.log('✅ GROQ_API_KEY loaded');
-  groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-}
-
-// Use OS temp directory for audio files (works on Render and locally)
+// Use OS temp directory for room persistence (works on Render and locally)
 const TEMP_DIR = os.tmpdir();
-
-// Clean up any leftover temp files from previous sessions
-const cleanupTempFiles = () => {
-  try {
-    const files = fs.readdirSync(TEMP_DIR);
-    const tempFiles = files.filter(f => f.startsWith('vm_temp_') && f.endsWith('.wav'));
-    if (tempFiles.length > 0) {
-      tempFiles.forEach(f => {
-        try { fs.unlinkSync(path.join(TEMP_DIR, f)); } catch (e) {}
-      });
-      console.log(`🧹 Cleaned up ${tempFiles.length} leftover temp files`);
-    }
-  } catch (e) {}
-};
-cleanupTempFiles();
 
 // ── Persistent room storage ──────────────────────────────────────────────────
 // Rooms are saved to a JSON file so they survive server restarts (Render free
@@ -137,15 +112,12 @@ const saveRooms = () => {
 // Store rooms and their participants
 const rooms = loadRooms();
 const userSockets = new Map();
-// Per-room active speaker lock: roomId → { socketId, lockedAt }
-const activeSpeakers = new Map();
-const SPEAKER_LOCK_TIMEOUT_MS = 12000; // auto-release if server hangs
 
 // Health check endpoint (keeps Render service alive)
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    groqConfigured: !!process.env.GROQ_API_KEY,
+    translation: 'browser-native (Web Speech API + Chrome built-in Translator)',
     rooms: rooms.size,
     uptime: process.uptime()
   });
@@ -307,339 +279,55 @@ app.post('/api/rooms/:roomId/verify', (req, res) => {
 io.on("connection", socket => {
   console.log(`🔗 User connected: ${socket.id}`);
 
-  // Audio transcription and translation
-  socket.on("send-audio", async (audioData) => {
-    try {
-      if (!groq) {
-        socket.emit("transcription-error", { 
-          error: "Translation service not configured",
-          details: "GROQ_API_KEY is not set" 
+  // ── Live transcripts (browser-native) ──────────────────────────────────────
+  // The speaker's browser does speech recognition (Web Speech API) and
+  // translation (Chrome built-in on-device Translator API), then sends the
+  // translated text for every room language here. The server only relays
+  // results to the right participants — no AI runs on the server.
+  const LANGUAGE_NAMES = {
+    'en': 'English', 'es': 'Spanish', 'fr': 'French', 'de': 'German',
+    'it': 'Italian', 'pt': 'Portuguese', 'ru': 'Russian', 'ja': 'Japanese',
+    'ko': 'Korean', 'zh': 'Chinese', 'ar': 'Arabic', 'hi': 'Hindi',
+    'tr': 'Turkish', 'nl': 'Dutch', 'pl': 'Polish',
+    'ta': 'Tamil', 'te': 'Telugu', 'ml': 'Malayalam', 'kn': 'Kannada'
+  };
+
+  socket.on('transcript-broadcast', ({ original, translations, speakerName, speakerLanguage }) => {
+    const userInfo = userSockets.get(socket.id);
+    if (!userInfo) return;
+    const room = rooms.get(userInfo.roomId);
+    if (!room) return;
+
+    const text = typeof original === 'string' ? original.trim() : '';
+    if (!text) return;
+
+    const sender = room.participants.find(p => p.id === socket.id);
+    const name = speakerName || (sender && sender.name) || 'Unknown';
+
+    console.log(`🌐 Transcript from ${name} (${userInfo.roomId}): "${text}"`);
+
+    room.participants.forEach(participant => {
+      // Skip the sender — they already show their own transcript locally
+      if (participant.id === socket.id) return;
+
+      const targetLang = participant.translationLanguage || 'en';
+      // Fallback: if the pair is missing (e.g. model unavailable on the
+      // speaker's device), deliver the original transcript instead
+      const translated =
+        (translations && typeof translations[targetLang] === 'string' && translations[targetLang]) || text;
+
+      const participantSocket = io.sockets.sockets.get(participant.id);
+      if (participantSocket) {
+        participantSocket.emit('participant-translation', {
+          original: text,
+          translated,
+          targetLanguage: targetLang,
+          targetLanguageName: LANGUAGE_NAMES[targetLang] || targetLang,
+          speakerName: name,
+          speakerLanguage: speakerLanguage || null
         });
-        return;
       }
-
-      console.log(`🎤 Received audio from ${socket.id}`);
-      
-      const { audio, targetLanguage = 'es' } = audioData;
-      
-      // Convert base64 audio to file
-      const buffer = Buffer.from(audio.split(",")[1], "base64");
-      const tempFilePath = path.join(TEMP_DIR, `vm_temp_${socket.id}_${Date.now()}.wav`);
-      fs.writeFileSync(tempFilePath, buffer);
-      console.log(`✅ Audio file created: ${tempFilePath} (${buffer.length} bytes)`);
-
-      // Transcribe audio using Whisper
-      console.log(`🎙️ Sending to Groq Whisper...`);
-      let text;
-      try {
-        const transcription = await groq.audio.transcriptions.create({
-          file: fs.createReadStream(tempFilePath),
-          model: "whisper-large-v3",
-          response_format: "verbose_json"
-        });
-
-        text = transcription.text;
-
-        // Reject low-confidence results
-        const avgNoSpeechProb = transcription.segments
-          ? transcription.segments.reduce((sum, s) => sum + (s.no_speech_prob || 0), 0) / (transcription.segments.length || 1)
-          : 0;
-        if (avgNoSpeechProb > 0.5) {
-          console.log(`🚫 Low confidence transcription, skipping`);
-          fs.unlinkSync(tempFilePath);
-          socket.emit("transcription-error", { error: "No clear speech detected" });
-          return;
-        }
-
-        console.log(`📝 Transcribed: ${text}`);
-      } catch (transcriptionError) {
-        console.error(`❌ Transcription failed:`, transcriptionError.message);
-        fs.unlinkSync(tempFilePath);
-        socket.emit("transcription-error", { 
-          error: "Failed to transcribe audio",
-          details: transcriptionError.message 
-        });
-        return;
-      }
-
-      // Get language name for better translation
-      const languageNames = {
-        'en': 'English', 'es': 'Spanish', 'fr': 'French', 'de': 'German',
-        'it': 'Italian', 'pt': 'Portuguese', 'ru': 'Russian', 'ja': 'Japanese',
-        'ko': 'Korean', 'zh': 'Chinese', 'ar': 'Arabic', 'hi': 'Hindi',
-        'tr': 'Turkish', 'nl': 'Dutch', 'pl': 'Polish',
-        'ta': 'Tamil', 'te': 'Telugu', 'ml': 'Malayalam', 'kn': 'Kannada'
-      };
-      
-      const targetLangName = languageNames[targetLanguage] || 'Spanish';
-
-      // Translate text to target language
-      console.log(`🔄 Translating to ${targetLangName}...`);
-      const translation = await groq.chat.completions.create({
-        model: "llama-3.3-70b-versatile",
-        messages: [
-          { 
-            role: "system", 
-            content: `You are a professional real-time interpreter. Your ONLY job is to translate the user's speech into ${targetLangName}. Output ONLY the translated text — no explanations, no notes, no alternatives. Preserve the original meaning exactly. Do NOT translate proper nouns.`
-          },
-          { 
-            role: "user", 
-            content: text 
-          }
-        ],
-        temperature: 0.1,
-        max_tokens: 1024
-      });
-
-      const translatedText = translation.choices[0].message.content;
-      console.log(`🌐 Translated to ${targetLangName}: ${translatedText}`);
-
-      // Send original + translated text back
-      socket.emit("transcription-result", {
-        original: text,
-        translated: translatedText,
-        targetLanguage,
-        targetLanguageName: targetLangName
-      });
-
-      // Delete temp file
-      fs.unlinkSync(tempFilePath);
-      console.log(`✅ Audio processing complete for ${socket.id}`);
-
-    } catch (err) {
-      console.error("❌ Error processing audio:", err);
-      socket.emit("transcription-error", { 
-        error: "Failed to process audio",
-        details: err.message 
-      });
-    }
-  });
-
-  // Continuous audio translation - broadcasts to all participants
-  socket.on("continuous-audio", async (audioData) => {
-    try {
-      if (!groq) {
-        console.log(`❌ Translation service not configured`);
-        return;
-      }
-
-      const { audio, roomId, speakerName, speakerLanguage: payloadSpeakerLang } = audioData;
-
-      const room = rooms.get(roomId);
-      if (!room) {
-        console.log(`❌ Room ${roomId} not found`);
-        return;
-      }
-
-      // Use speaker language from the server-stored participant record (authoritative),
-      // falling back to the payload value for backward compatibility.
-      const senderParticipant = room.participants.find(p => p.id === socket.id);
-      const speakerLanguage = senderParticipant?.speakerLanguage || payloadSpeakerLang || null;
-
-      // ── Speaker lock: only one active speaker per room ───────────────────
-      const now = Date.now();
-      const current = activeSpeakers.get(roomId);
-
-      if (current && current.socketId !== socket.id) {
-        // Auto-release stale lock (in case previous processing hung)
-        if (now - current.lockedAt < SPEAKER_LOCK_TIMEOUT_MS) {
-          console.log(`🔒 Room ${roomId} busy — ${current.speakerName} is speaking, dropping ${speakerName}'s chunk`);
-          socket.emit('speaker-busy', { activeSpeaker: current.speakerName });
-          return;
-        }
-        console.log(`⏰ Stale speaker lock released for ${current.speakerName}`);
-      }
-
-      // Acquire lock
-      activeSpeakers.set(roomId, { socketId: socket.id, speakerName, lockedAt: now });
-      console.log(`🔓 Speaker lock acquired: ${speakerName} in room ${roomId}`);
-
-      console.log(`🎤 Audio chunk | Speaker: ${speakerName} | Room: ${roomId} | Size: ${audio ? audio.length : 0} chars`);
-
-      // Convert base64 audio to file
-      if (!audio || !audio.includes(',')) {
-        console.log(`❌ Invalid audio data format`);
-        activeSpeakers.delete(roomId);
-        return;
-      }
-
-      const buffer = Buffer.from(audio.split(",")[1], "base64");
-
-      // Reject suspiciously small buffers (pure silence / codec header only)
-      if (buffer.length < 1000) {
-        console.log(`⚠️ Buffer too small (${buffer.length}B), skipping`);
-        activeSpeakers.delete(roomId);
-        return;
-      }
-
-      const tempFilePath = path.join(TEMP_DIR, `vm_temp_${socket.id}_${Date.now()}.wav`);
-      fs.writeFileSync(tempFilePath, buffer);
-
-      // Transcribe
-      let text;
-      try {
-        const transcriptionParams = {
-          file: fs.createReadStream(tempFilePath),
-          model: "whisper-large-v3",
-          response_format: "verbose_json"  // gives us no_speech_prob for confidence filtering
-        };
-        // If the speaker's language is known, pass it as a hint to Whisper
-        // This significantly improves accuracy in noisy/accented speech
-        if (speakerLanguage) {
-          transcriptionParams.language = speakerLanguage;
-          console.log(`🌐 Whisper language hint: ${speakerLanguage}`);
-        }
-        const transcription = await groq.audio.transcriptions.create(transcriptionParams);
-        text = transcription.text?.trim();
-        console.log(`📝 Transcribed: "${text}"`);
-
-        // Reject low-confidence transcriptions (Whisper hallucinating on silence/noise)
-        const avgNoSpeechProb = transcription.segments
-          ? transcription.segments.reduce((sum, s) => sum + (s.no_speech_prob || 0), 0) / (transcription.segments.length || 1)
-          : 0;
-        if (avgNoSpeechProb > 0.5) {
-          console.log(`🚫 Low confidence (no_speech_prob: ${avgNoSpeechProb.toFixed(2)}), skipping`);
-          fs.unlinkSync(tempFilePath);
-          activeSpeakers.delete(roomId);
-          return;
-        }
-
-        if (!text || text.length < 3) {
-          console.log(`⚠️ Empty/too-short transcription, skipping`);
-          fs.unlinkSync(tempFilePath);
-          activeSpeakers.delete(roomId);
-          return;
-        }
-
-        // Filter Whisper hallucinations — common silence artifacts
-        const HALLUCINATIONS = [
-          /^(thank you|thanks|you|bye|goodbye|see you|see you later|\.+|,+|\s+)$/i,
-          /^\[.*\]$/,  // e.g. [Music], [Applause], [BLANK_AUDIO]
-          /^(um+|uh+|hmm+|ah+|oh+|mm+)\.?$/i,
-          /^(subtitles|subtitle|captions|caption|transcribed|transcription)/i,
-          /thank you for (watching|listening)/i,
-          /^(yes|no|ok|okay|sure|right|alright|yeah|yep|nope)\.?$/i,
-          /^\W+$/  // only punctuation/whitespace
-        ];
-        if (HALLUCINATIONS.some(re => re.test(text))) {
-          console.log(`🚫 Hallucination filtered: "${text}"`);
-          fs.unlinkSync(tempFilePath);
-          activeSpeakers.delete(roomId);
-          return;
-        }
-      } catch (transcriptionError) {
-        console.error(`❌ Transcription failed:`, transcriptionError.message);
-        try { fs.unlinkSync(tempFilePath); } catch (e) {}
-        activeSpeakers.delete(roomId);
-        return;
-      }
-
-      // Language map
-      const languageNames = {
-        'en': 'English', 'es': 'Spanish', 'fr': 'French', 'de': 'German',
-        'it': 'Italian', 'pt': 'Portuguese', 'ru': 'Russian', 'ja': 'Japanese',
-        'ko': 'Korean', 'zh': 'Chinese', 'ar': 'Arabic', 'hi': 'Hindi',
-        'tr': 'Turkish', 'nl': 'Dutch', 'pl': 'Polish',
-        'ta': 'Tamil', 'te': 'Telugu', 'ml': 'Malayalam', 'kn': 'Kannada'
-      };
-
-      // Include the speaker themselves if they have a translation language set
-      // This lets the speaker see/hear their own speech translated
-      const speakerParticipant = room.participants.find(p => p.id === socket.id);
-      const speakerTargetLang = speakerParticipant?.translationLanguage || null;
-
-      // Group ALL participants (including speaker) by their preferred translation language
-      const participantsByLanguage = new Map();
-
-      // Add other participants
-      room.participants
-        .filter(p => p.id !== socket.id)
-        .forEach(participant => {
-          const lang = participant.translationLanguage || 'en';
-          if (!participantsByLanguage.has(lang)) participantsByLanguage.set(lang, []);
-          participantsByLanguage.get(lang).push(participant);
-        });
-
-      // Always include the speaker in their own target language so they see their translation
-      if (speakerTargetLang) {
-        if (!participantsByLanguage.has(speakerTargetLang)) {
-          participantsByLanguage.set(speakerTargetLang, []);
-        }
-        // Add speaker socket to receive their own translation
-        participantsByLanguage.get(speakerTargetLang).push({ id: socket.id, isSelf: true });
-      }
-
-      if (participantsByLanguage.size === 0) {
-        console.log(`⚠️ No participants to translate for (no language preferences set)`);
-        fs.unlinkSync(tempFilePath);
-        activeSpeakers.delete(roomId);
-        return;
-      }
-
-      // Translate once per unique target language, send to all who need it
-      const translationPromises = Array.from(participantsByLanguage.entries()).map(async ([targetLang, participants]) => {
-        try {
-          const targetLangName = languageNames[targetLang] || 'English';
-          console.log(`🔄 Translating to ${targetLangName}...`);
-
-          const translation = await groq.chat.completions.create({
-            model: "llama-3.3-70b-versatile",
-            messages: [
-              {
-                role: "system",
-                content: `You are a professional real-time interpreter. Your ONLY job is to translate the user's speech into ${targetLangName}.
-
-Rules:
-- Output ONLY the translated text. No explanations, no notes, no alternatives.
-- Preserve the original meaning, tone, and sentence structure as closely as possible.
-- If the input is a single word or short phrase, translate it as-is.
-- Do NOT add greetings, filler words, or anything not in the original.
-- Do NOT translate proper nouns (names of people, places, brands).`
-              },
-              { role: "user", content: text }
-            ],
-            temperature: 0.1,
-            max_tokens: 512
-          });
-
-          const translatedText = translation.choices[0].message.content?.trim();
-          if (!translatedText) return;
-
-          console.log(`✅ → ${targetLangName}: "${translatedText}"`);
-
-          participants.forEach(participant => {
-            const targetSocketId = participant.id;
-            const participantSocket = io.sockets.sockets.get(targetSocketId);
-            if (participantSocket) {
-              participantSocket.emit('participant-translation', {
-                original: text,
-                translated: translatedText,
-                targetLanguage: targetLang,
-                targetLanguageName: targetLangName,
-                speakerName
-              });
-            }
-          });
-        } catch (err) {
-          console.error(`❌ Translation error for ${targetLang}:`, err.message);
-        }
-      });
-
-      await Promise.all(translationPromises);
-      fs.unlinkSync(tempFilePath);
-
-      // Release speaker lock
-      activeSpeakers.delete(roomId);
-      console.log(`🔓 Speaker lock released: ${speakerName}`);
-
-    } catch (err) {
-      console.error("❌ Error processing continuous audio:", err.message);
-      // Always release lock on error
-      try {
-        const { roomId } = audioData || {};
-        if (roomId) activeSpeakers.delete(roomId);
-      } catch (e) {}
-    }
+    });
   });
 
   socket.on('join-room', ({ roomId, passcode, participantName, participantEmail, isHost, translationLanguage, speakerLanguage }) => {
@@ -726,7 +414,7 @@ Rules:
       isScreenSharing: false,
       hasRaisedHand: false,
       translationLanguage: translationLanguage || 'en', // Store user's preferred language
-      speakerLanguage: speakerLanguage || 'en',          // Language user speaks in (for Whisper)
+      speakerLanguage: speakerLanguage || 'en',          // Language user speaks in (for speech recognition)
       joinedAt: new Date().toISOString()
     };
     
@@ -1085,22 +773,7 @@ Rules:
 
   socket.on("disconnect", () => {
     console.log(`🔌 Client disconnected: ${socket.id}`);
-    
-    // Clean up any temp files for this socket
-    try {
-      const files = fs.readdirSync(TEMP_DIR);
-      files.filter(f => f.startsWith(`vm_temp_${socket.id}`) && f.endsWith('.wav'))
-           .forEach(f => { try { fs.unlinkSync(path.join(TEMP_DIR, f)); } catch (e) {} });
-    } catch (e) {}
 
-    // Release speaker lock if this socket held it
-    activeSpeakers.forEach((value, roomId) => {
-      if (value.socketId === socket.id) {
-        activeSpeakers.delete(roomId);
-        console.log(`🔓 Speaker lock released on disconnect for room ${roomId}`);
-      }
-    });
-    
     const userInfo = userSockets.get(socket.id);
     if (userInfo) {
       const { roomId, participant } = userInfo;
@@ -1146,7 +819,10 @@ Rules:
           
           // Clean up empty rooms
           if (room.participants.length === 0) {
+            if (roomEndTimers.has(roomId)) { clearTimeout(roomEndTimers.get(roomId)); roomEndTimers.delete(roomId); }
             rooms.delete(roomId);
+            saveRooms();
+            io.emit('room-deleted', { id: roomId });
             console.log(`🗑️ Room ${roomId} deleted (empty)`);
           }
         }
@@ -1157,12 +833,12 @@ Rules:
   });
 });
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5001;
 
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log("📹 WebRTC signaling server ready - ADMIN PRIVILEGES ENABLED");
-  console.log("🎤 Audio translation powered by Groq (Whisper + Llama 3.3)");
+  console.log("🎤 Live translation: browser speech recognition + on-device translation (no API keys)");
   console.log("👑 Admin can remove participants and end meetings");
   console.log("💬 Chat and reactions enabled");
   console.log("🖐️ Raise hand functionality enabled");

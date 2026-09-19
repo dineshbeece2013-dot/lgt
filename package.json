@@ -1,13 +1,13 @@
 {
   "name": "video-meet",
   "version": "1.0.0",
+  "private": true,
+  "description": "VideoMeet Pro - WebRTC video conferencing with real-time speech translation",
   "scripts": {
-    "start": "cd server && npm install && npm start",
+    "install-all": "cd server && npm install && cd ../client && npm install",
     "server": "cd server && npm start",
     "client": "cd client && npm start",
-    "install-all": "cd server && npm install && cd ../client && npm install"
-  },
-  "dependencies": {
-    "react-router-dom": "^7.11.0"
+    "start": "cd server && npm start",
+    "build": "cd client && npm run build"
   }
 }

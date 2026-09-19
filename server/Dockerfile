@@ -7,6 +7,6 @@ RUN npm install --omit=dev
 
 COPY . .
 
-EXPOSE 10000
+EXPOSE 5001
 
 CMD ["node", "index.js"]

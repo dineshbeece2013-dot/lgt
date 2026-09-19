@@ -1,6 +1,20 @@
-# Ignore environment files
-server/.env
-
-# Ignore node_modules
+# Dependencies
+node_modules/
 server/node_modules/
 client/node_modules/
+
+# Environment files
+server/.env
+.env
+
+# Build output
+client/build/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+

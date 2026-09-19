@@ -2,10 +2,25 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { useParams, useLocation, useNavigate } from 'react-router-dom';
 import io from 'socket.io-client';
 import { SOCKET_URL } from '../config';
-import LanguageSelector from './LanguageSelector';
+import LanguageSelector, { SUPPORTED_LANGUAGES } from './LanguageSelector';
 import { useNoiseSuppression } from '../hooks/useNoiseSuppression';
 import Whiteboard from './Whiteboard';
 import './VideoCall.css';
+
+// Browser speech locales for the Web Speech API (STT) and TTS
+const SPEECH_LOCALES = {
+  'en': 'en-US', 'ta': 'ta-IN', 'hi': 'hi-IN', 'te': 'te-IN', 'ml': 'ml-IN', 'kn': 'kn-IN',
+  'es': 'es-ES', 'fr': 'fr-FR', 'de': 'de-DE', 'it': 'it-IT', 'pt': 'pt-PT', 'ru': 'ru-RU',
+  'ja': 'ja-JP', 'ko': 'ko-KR', 'zh': 'zh-CN', 'ar': 'ar-SA', 'tr': 'tr-TR', 'nl': 'nl-NL', 'pl': 'pl-PL'
+};
+
+const getLanguageName = (code) =>
+  (SUPPORTED_LANGUAGES.find(l => l.code === code) || {}).name || code;
+
+// Browser-native speech recognition (Chrome/Edge/Safari)
+const SpeechRecognition = typeof window !== 'undefined'
+  ? (window.SpeechRecognition || window.webkitSpeechRecognition)
+  : null;
 
 function VideoCall() {
   const { roomId } = useParams();
@@ -33,19 +48,14 @@ function VideoCall() {
   const [showAudioWarning, setShowAudioWarning] = useState(false);
   const [audioDevices, setAudioDevices] = useState([]);
   
-  // Translation state
+  // Translation state (browser-native: Web Speech API + Chrome built-in Translator)
   const [translationEnabled, setTranslationEnabled] = useState(false);
   const [translationLanguage, setTranslationLanguage] = useState('es');
   const [speakerLanguage, setSpeakerLanguage] = useState('en'); // language the user speaks in
-  const [isTranslating, setIsTranslating] = useState(false);
   const [transcriptionResults, setTranscriptionResults] = useState([]);
   const [showTranscriptions, setShowTranscriptions] = useState(false);
-  const [audioRecorder, setAudioRecorder] = useState(null);
-  const [isCapturingAudio, setIsCapturingAudio] = useState(false);
-  const [continuousRecorder, setContinuousRecorder] = useState(null);
-  const continuousRecorderRef = useRef(null);
-  const speakerLanguageRef = useRef('en'); // always holds latest speaker language for VAD closure
-  const [translationStatus, setTranslationStatus] = useState(''); // Status message for debugging
+  const speakerLanguageRef = useRef('en'); // always holds latest speaker language for recognition closure
+  const [translationStatus, setTranslationStatus] = useState(''); // Status message for the translation panel
   
   // Noise suppression (Krisp-equivalent via RNNoise WASM)
   const {
@@ -74,6 +84,14 @@ function VideoCall() {
   useEffect(() => {
     speakerLanguageRef.current = speakerLanguage;
   }, [speakerLanguage]);
+
+  useEffect(() => {
+    translationLanguageRef.current = translationLanguage;
+  }, [translationLanguage]);
+
+  useEffect(() => {
+    participantsRef.current = participants;
+  }, [participants]);
 
   // Unlock TTS on first user interaction (browser autoplay policy)
   const unlockTts = useCallback(() => {
@@ -196,6 +214,14 @@ function VideoCall() {
   const autoRecorderRef = useRef(null);
   const autoRecordingChunksRef = useRef([]);
   const meetingJoinTimeRef = useRef(null);
+
+  // Translation refs (browser-native STT + on-device translation)
+  const recognitionRef = useRef(null);        // active SpeechRecognition instance
+  const speechActiveRef = useRef(false);      // true while auto-translate should stay on
+  const translatorCacheRef = useRef(new Map()); // "src>dst" → Translator instance (or null = unavailable)
+  const translationLanguageRef = useRef('es');  // latest own translation language
+  const participantsRef = useRef([]);           // latest participants (for target languages)
+  const handleFinalTranscriptRef = useRef(null);// latest transcript handler (avoids stale closures)
 
   // Start meeting elapsed timer
   const startMeetingTimer = useCallback((room) => {
@@ -706,23 +732,6 @@ function VideoCall() {
     });
 
     // Translation event handlers
-    socket.on('transcription-result', (result) => {
-      console.log('📝 Transcription result:', result);
-      setIsTranslating(false);
-      
-      const newResult = {
-        id: Date.now(),
-        original: result.original,
-        translated: result.translated,
-        targetLanguage: result.targetLanguage,
-        targetLanguageName: result.targetLanguageName,
-        speakerName: result.speakerName || 'Unknown',
-        timestamp: new Date().toLocaleTimeString()
-      };
-      
-      setTranscriptionResults(prev => [...prev, newResult]);
-      setShowTranscriptions(true);
-    });
 
     // Handle incoming translations from other participants
     socket.on('participant-translation', (data) => {
@@ -752,29 +761,6 @@ function VideoCall() {
       }
     });
 
-    socket.on('transcription-error', (error) => {
-      console.error('❌ Transcription error:', error);
-      setIsTranslating(false);
-      // Fallback: show subtitle instead of alert
-      const fallbackResult = {
-        id: Date.now(),
-        original: '[Translation failed]',
-        translated: `⚠️ ${error.error || 'Translation unavailable — check your connection'}`,
-        targetLanguage: translationLanguage,
-        targetLanguageName: 'Error',
-        speakerName: 'System',
-        timestamp: new Date().toLocaleTimeString(),
-        isFallback: true
-      };
-      setTranscriptionResults(prev => [...prev, fallbackResult]);
-      setShowTranscriptions(true);
-    });
-
-    socket.on('speaker-busy', ({ activeSpeaker }) => {
-      console.log(`🔒 Speaker busy: ${activeSpeaker} is currently speaking`);
-      setTranslationStatus(`🔒 ${activeSpeaker} is speaking...`);
-    });
-
     // Whiteboard sync is handled by the Whiteboard component directly
 
     socket.on('error', (message) => {
@@ -801,13 +787,6 @@ function VideoCall() {
           isHost: isHost || false,
           translationLanguage: userLang || 'en',
           speakerLanguage: location.state?.speakerLanguage || 'en'
-        });socket.emit('join-room', {
-          roomId,
-          passcode,
-          participantName,
-          participantEmail,
-          isHost: isHost || false,
-          translationLanguage: userLang || 'en'
         });
       }
     });
@@ -1159,232 +1138,215 @@ function VideoCall() {
     setShowStats(true);
   }, []);
 
-  // Translation functions
-  
-  // Continuous translation — VAD-driven smart chunking
-  // Flow: monitor RMS → speech starts → record → silence gap → send chunk → repeat
-  const startContinuousTranslation = useCallback(async () => {
-    try {
-      if (!localStreamRef.current) {
-        alert('No audio stream available. Please check your microphone.');
-        return;
-      }
-      if (!socketRef.current || !socketRef.current.connected) {
-        alert('Not connected to server. Please wait and try again.');
-        return;
-      }
-      if (continuousRecorderRef.current) {
-        console.log('⚠️ Continuous translation already running');
-        return;
-      }
+  // ── Browser-native translation pipeline ──────────────────────────────────
+  // Speech recognition:  Web Speech API (built into Chrome/Edge/Safari)
+  // Translation:         Chrome built-in on-device Translator API
+  // Text-to-speech:      browser SpeechSynthesis (unchanged)
+  // No server AI involved — the server only relays results to the room.
 
-      console.log('🎤 Starting VAD-driven continuous translation...');
-      setTranslationEnabled(true);
-      // Auto-enable TTS so translated speech is heard immediately
-      setTtsEnabled(true);
-      ttsEnabledRef.current = true;
-      // Unlock TTS audio context (requires being called from a user gesture chain)
-      unlockTts();
-
-      const audioTrack = localStreamRef.current.getAudioTracks()[0];
-      if (!audioTrack) {
-        alert('No audio track available. Please check your microphone permissions.');
-        setTranslationEnabled(false);
-        return;
-      }
-
-      const participantName = location.state?.participantName || 'Unknown';
-      let isRunning = true;
-
-      // ── Web Audio API setup ──────────────────────────────────────────────
-      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-
-      // Resume AudioContext if suspended (browser autoplay policy)
-      if (audioContext.state === 'suspended') {
-        await audioContext.resume();
-        console.log('▶️ AudioContext resumed');
-      }
-
-      // Use the RAW (unprocessed) stream for VAD analysis so RNNoise doesn't
-      // suppress the signal below the speech threshold.
-      // rawStreamRef holds the original mic stream before noise suppression.
-      const vadAudioTrack = rawStreamRef.current
-        ? rawStreamRef.current.getAudioTracks()[0]
-        : audioTrack;
-
-      const micStream = new MediaStream([vadAudioTrack]);
-      const sourceNode = audioContext.createMediaStreamSource(micStream);
-
-      // High-pass filter at 80 Hz — removes low-frequency hum/rumble
-      const highPass = audioContext.createBiquadFilter();
-      highPass.type = 'highpass';
-      highPass.frequency.value = 80;
-
-      const analyser = audioContext.createAnalyser();
-      analyser.fftSize = 1024;
-      analyser.smoothingTimeConstant = 0.3;
-      sourceNode.connect(highPass);
-      highPass.connect(analyser);
-
-      const pcmBuffer = new Float32Array(analyser.fftSize);
-
-      const getRMS = () => {
-        analyser.getFloatTimeDomainData(pcmBuffer);
-        let sum = 0;
-        for (let i = 0; i < pcmBuffer.length; i++) sum += pcmBuffer[i] * pcmBuffer[i];
-        return Math.sqrt(sum / pcmBuffer.length);
-      };
-
-      // ── Tuning constants ─────────────────────────────────────────────────
-      const SPEECH_THRESHOLD  = 0.018; // RMS above this = speech (raised to avoid background noise)
-      const SILENCE_THRESHOLD = 0.010; // RMS below this = silence
-      const SILENCE_GAP_MS    = 900;   // ms of silence before we cut the chunk
-      const MAX_CHUNK_MS      = 10000; // hard cap — send even if still speaking
-      const MIN_CHUNK_MS      = 600;   // ignore chunks shorter than this (avoids noise bursts)
-      const VAD_POLL_MS       = 80;    // how often we sample RMS
-      // Consecutive speech frames required before we start recording (debounce)
-      const SPEECH_ONSET_FRAMES = 3;
-      let speechOnsetCount = 0;
-
-      // ── VAD state machine ────────────────────────────────────────────────
-      const mimeType = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus']
-        .find(m => MediaRecorder.isTypeSupported(m)) || 'audio/webm';
-
-      let recorder = null;
-      let chunks = [];
-      let speechStartTime = 0;
-      let silenceStartTime = 0;
-      let isSpeaking = false;
-
-      const sendChunk = () => {
-        if (!recorder || recorder.state !== 'recording') return;
-        recorder.stop(); // onstop will handle sending
-      };
-
-      const startRecording = () => {
-        chunks = [];
-        speechStartTime = Date.now();
-        const recStream = new MediaStream([audioTrack]);
-        recorder = new MediaRecorder(recStream, { mimeType, audioBitsPerSecond: 64000 });
-
-        recorder.ondataavailable = (e) => {
-          if (e.data && e.data.size > 0) chunks.push(e.data);
-        };
-
-        recorder.onstop = () => {
-          if (!isRunning) return;
-          const duration = Date.now() - speechStartTime;
-          if (duration < MIN_CHUNK_MS) {
-            console.log(`⚡ Chunk too short (${duration}ms), discarding`);
-            return;
-          }
-          const blob = new Blob(chunks, { type: mimeType });
-          console.log(`📦 Sending chunk: ${blob.size}B, ${duration}ms`);
-          setTranslationStatus('🗣️ Processing speech...');
-
-          const reader = new FileReader();
-          reader.readAsDataURL(blob);
-          reader.onloadend = () => {
-            if (!isRunning || !socketRef.current?.connected) return;
-            socketRef.current.emit('continuous-audio', {
-              audio: reader.result,
-              roomId,
-              speakerName: participantName,
-              speakerLanguage: speakerLanguageRef.current || 'en'
-            });
-            setTranslationStatus('✅ Sent — listening...');
-          };
-        };
-
-        recorder.onerror = (e) => console.error('❌ Recorder error:', e.error);
-        recorder.start(200); // collect data every 200ms for smooth streaming
-        console.log('🎙️ Recording started');
-      };
-
-      // ── VAD polling loop ─────────────────────────────────────────────────
-      const vadInterval = setInterval(() => {
-        if (!isRunning) return;
-
-        const rms = getRMS();
-
-        if (!isSpeaking) {
-          if (rms >= SPEECH_THRESHOLD) {
-            speechOnsetCount++;
-            if (speechOnsetCount >= SPEECH_ONSET_FRAMES) {
-              // Confirmed speech onset (not a noise spike)
-              isSpeaking = true;
-              speechOnsetCount = 0;
-              silenceStartTime = 0;
-              setTranslationStatus('🎤 Speaking...');
-              console.log(`🗣️ Speech onset confirmed (RMS ${rms.toFixed(4)})`);
-              startRecording();
-            }
-          } else {
-            speechOnsetCount = 0;
-            setTranslationStatus(`🔇 Listening... (level: ${rms.toFixed(4)})`);
-          }
-        } else {
-          // Currently speaking
-          const elapsed = Date.now() - speechStartTime;
-
-          if (rms < SILENCE_THRESHOLD) {
-            if (silenceStartTime === 0) silenceStartTime = Date.now();
-            const silenceDuration = Date.now() - silenceStartTime;
-
-            if (silenceDuration >= SILENCE_GAP_MS) {
-              // Silence gap reached — cut the chunk
-              isSpeaking = false;
-              silenceStartTime = 0;
-              console.log(`🔇 Silence gap (${silenceDuration}ms), cutting chunk`);
-              sendChunk();
-            }
-          } else {
-            // Still speaking — reset silence timer
-            silenceStartTime = 0;
-
-            if (elapsed >= MAX_CHUNK_MS) {
-              // Hard cap reached — send and restart immediately
-              console.log(`⏱️ Max chunk duration reached (${elapsed}ms), splitting`);
-              sendChunk();
-              // Brief pause then restart recording
-              setTimeout(() => {
-                if (isRunning && isSpeaking) startRecording();
-              }, 100);
-            }
-          }
-        }
-      }, VAD_POLL_MS);
-
-      // Store stop handle
-      continuousRecorderRef.current = {
-        recorder: null,
-        stop: () => {
-          isRunning = false;
-          clearInterval(vadInterval);
-          if (recorder && recorder.state === 'recording') recorder.stop();
-          try { audioContext.close(); } catch (e) {}
-        }
-      };
-
-      console.log('✅ VAD translation loop started');
-
-    } catch (error) {
-      console.error('❌ Error starting continuous translation:', error);
-      setTranslationEnabled(false);
-      alert('Failed to start continuous translation: ' + error.message);
+  // Get (or create) an on-device Translator for a language pair
+  const getTranslator = useCallback(async (source, target) => {
+    const key = `${source}>${target}`;
+    if (translatorCacheRef.current.has(key)) {
+      const cached = translatorCacheRef.current.get(key);
+      if (cached) return cached;
+      throw new Error(`Translator unavailable for ${key}`);
     }
-  }, [roomId, location.state]);
+
+    if (!('Translator' in window) || typeof window.Translator?.availability !== 'function') {
+      translatorCacheRef.current.set(key, null);
+      throw new Error('This browser does not support the built-in Translator API');
+    }
+
+    const availability = await window.Translator.availability({
+      sourceLanguage: source,
+      targetLanguage: target
+    });
+    if (availability === 'unavailable') {
+      translatorCacheRef.current.set(key, null);
+      throw new Error(`On-device translation ${source} → ${target} is unavailable`);
+    }
+
+    const translator = await window.Translator.create({
+      sourceLanguage: source,
+      targetLanguage: target,
+      monitor: (m) => {
+        m.addEventListener('downloadprogress', (e) => {
+          if (e.loaded < 1) {
+            setTranslationStatus(`⬇️ Downloading translation model (${Math.floor(e.loaded * 100)}%)...`);
+          }
+        });
+      }
+    });
+    translatorCacheRef.current.set(key, translator);
+    return translator;
+  }, []);
+
+  // Translate text on-device (Chrome built-in Translator). Never throws —
+  // falls back to the original text so captions keep flowing.
+  const translateText = useCallback(async (text, source, target) => {
+    if (!text || !text.trim() || source === target) return text;
+    try {
+      const translator = await getTranslator(source, target);
+      const translated = await translator.translate(text);
+      return translated || text;
+    } catch (err) {
+      console.warn(`⚠️ Translation ${source} → ${target} failed:`, err.message);
+      return text; // fallback: deliver the original transcript
+    }
+  }, [getTranslator]);
+
+  // Handle a final transcript from the speech recognizer: show it locally,
+  // translate it on-device into every participant's target language and
+  // broadcast the results (the server relays per participant).
+  const handleFinalTranscript = useCallback(async (originalText) => {
+    const text = (originalText || '').trim();
+    if (!text || !socketRef.current?.connected) return;
+
+    const speakerName = location.state?.participantName || 'Unknown';
+    const sourceLang = speakerLanguageRef.current || 'en';
+    const myTarget = translationLanguageRef.current || 'en';
+
+    // Collect every target language in the room (others' + own)
+    const targets = new Set([myTarget]);
+    participantsRef.current.forEach(p => {
+      if (socketRef.current && p.id !== socketRef.current.id) {
+        targets.add(p.translationLanguage || 'en');
+      }
+    });
+
+    // Translate once per unique target language (on-device)
+    const translations = {};
+    for (const lang of targets) {
+      translations[lang] = lang === sourceLang ? text : await translateText(text, sourceLang, lang);
+    }
+
+    const timestamp = new Date().toLocaleTimeString();
+
+    // Show own transcript card (original + own translation)
+    setTranscriptionResults(prev => [...prev.slice(-49), {
+      id: `${Date.now()}-self-${Math.random().toString(36).slice(2, 7)}`,
+      original: text,
+      translated: translations[myTarget] ?? text,
+      targetLanguage: myTarget,
+      targetLanguageName: getLanguageName(myTarget),
+      speakerName,
+      timestamp,
+      isFallback: false
+    }]);
+    setShowTranscriptions(true);
+
+    // Relay to the room — the server fans out per participant language
+    socketRef.current.emit('transcript-broadcast', {
+      roomId,
+      speakerName,
+      speakerLanguage: sourceLang,
+      original: text,
+      translations,
+      timestamp
+    });
+  }, [roomId, location.state, translateText]);
+
+  // Keep the latest handler reachable from the recognizer's event closures
+  useEffect(() => {
+    handleFinalTranscriptRef.current = handleFinalTranscript;
+  }, [handleFinalTranscript]);
+
+  // Continuous live translation — browser speech recognition
+  const startContinuousTranslation = useCallback(() => {
+    if (!localStreamRef.current) {
+      alert('No audio stream available. Please check your microphone.');
+      return;
+    }
+    if (!socketRef.current || !socketRef.current.connected) {
+      alert('Not connected to server. Please wait and try again.');
+      return;
+    }
+    if (!SpeechRecognition) {
+      alert('Speech recognition is not supported in this browser. Please use Chrome or Edge.');
+      setTranslationStatus('❌ Speech recognition not supported in this browser');
+      return;
+    }
+    if (recognitionRef.current) {
+      console.log('⚠️ Continuous translation already running');
+      return;
+    }
+
+    console.log('🎤 Starting browser speech recognition...');
+    setTranslationEnabled(true);
+    // Auto-enable TTS so translated speech is heard immediately
+    setTtsEnabled(true);
+    ttsEnabledRef.current = true;
+    // Unlock TTS audio context (requires being called from a user gesture chain)
+    unlockTts();
+    speechActiveRef.current = true;
+
+    const recognition = new SpeechRecognition();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.maxAlternatives = 1;
+    recognition.lang = SPEECH_LOCALES[speakerLanguageRef.current] || 'en-US';
+
+    recognition.onresult = (event) => {
+      let interim = '';
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i];
+        const transcript = (result[0]?.transcript || '').trim();
+        if (result.isFinal) {
+          if (transcript && handleFinalTranscriptRef.current) {
+            handleFinalTranscriptRef.current(transcript);
+          }
+        } else if (transcript) {
+          interim = transcript;
+        }
+      }
+      setTranslationStatus(interim ? `🎤 “...${interim.slice(-60)}”` : '🎤 Listening...');
+    };
+
+    recognition.onerror = (event) => {
+      if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+        speechActiveRef.current = false;
+        setTranslationEnabled(false);
+        setTranslationStatus('❌ Microphone access denied for speech recognition');
+        alert('Microphone access for speech recognition was denied. Please allow it and try again.');
+      } else if (event.error === 'network') {
+        setTranslationStatus('❌ Speech recognition network error — check your connection');
+      } else if (event.error !== 'no-speech' && event.error !== 'aborted') {
+        console.warn('⚠️ Speech recognition error:', event.error);
+      }
+    };
+
+    // Chrome ends recognition after silence — restart while auto-translate is on
+    recognition.onend = () => {
+      if (speechActiveRef.current) {
+        try { recognition.start(); } catch (e) { /* already starting */ }
+      }
+    };
+
+    recognitionRef.current = recognition;
+    try {
+      recognition.start();
+      setTranslationStatus('🎤 Listening...');
+      console.log('✅ Speech recognition started (lang: ' + recognition.lang + ')');
+    } catch (error) {
+      console.error('❌ Error starting speech recognition:', error);
+      speechActiveRef.current = false;
+      recognitionRef.current = null;
+      setTranslationEnabled(false);
+      alert('Failed to start speech recognition: ' + error.message);
+    }
+  }, [roomId]);
 
   const stopContinuousTranslation = useCallback(() => {
-    if (continuousRecorderRef.current) {
+    speechActiveRef.current = false;
+    if (recognitionRef.current) {
       console.log('🛑 Stopping continuous translation...');
-      const { stop } = continuousRecorderRef.current;
-      if (stop) stop(); // clears VAD interval, stops recorder, closes AudioContext
-      continuousRecorderRef.current = null;
-      setTranslationEnabled(false);
-      setTranslationStatus('');
-      console.log('✅ Continuous translation stopped');
+      try { recognitionRef.current.stop(); } catch (e) {}
+      recognitionRef.current = null;
     }
+    setTranslationEnabled(false);
+    setTranslationStatus('');
+    console.log('✅ Continuous translation stopped');
   }, []);
 
   const toggleContinuousTranslation = useCallback(() => {
@@ -1408,7 +1370,7 @@ function VideoCall() {
     console.log(`🌐 Translation language changed to: ${newLang}`);
   }, [translationEnabled, stopContinuousTranslation, startContinuousTranslation]);
 
-  // Change speaker language mid-meeting (what the user speaks in, sent to Whisper)
+  // Change speaker language mid-meeting (what the user speaks in, used by speech recognition)
   const changeSpeakerLanguage = useCallback((newLang) => {
     setSpeakerLanguage(newLang);
     if (socketRef.current?.connected) {
@@ -1420,101 +1382,6 @@ function VideoCall() {
     }
     console.log(`🎤 Speaker language changed to: ${newLang}`);
   }, [translationEnabled, stopContinuousTranslation, startContinuousTranslation]);
-
-  // Manual translation (original functionality)
-  const startTranslation = useCallback(async () => {
-    try {
-      if (!localStreamRef.current) {
-        alert('No audio stream available');
-        return;
-      }
-
-      console.log('🎤 Starting audio capture for translation...');
-      setIsCapturingAudio(true);
-      
-      // Create MediaRecorder for audio capture
-      const audioStream = new MediaStream();
-      const audioTrack = localStreamRef.current.getAudioTracks()[0];
-      
-      if (!audioTrack) {
-        alert('No audio track available');
-        setIsCapturingAudio(false);
-        return;
-      }
-      
-      audioStream.addTrack(audioTrack);
-      
-      const recorder = new MediaRecorder(audioStream, {
-        mimeType: 'audio/webm'
-      });
-      
-      const audioChunks = [];
-      
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          audioChunks.push(event.data);
-        }
-      };
-      
-      recorder.onstop = async () => {
-        console.log('🎤 Audio capture stopped, processing...');
-        setIsTranslating(true);
-        
-        try {
-          const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
-          
-          // Convert to base64
-          const reader = new FileReader();
-          reader.readAsDataURL(audioBlob);
-          reader.onloadend = () => {
-            const base64Audio = reader.result;
-            
-            // Send to server for transcription and translation
-            socketRef.current.emit('send-audio', {
-              audio: base64Audio,
-              targetLanguage: translationLanguage
-            });
-          };
-        } catch (err) {
-          console.error('❌ Error processing audio:', err);
-          setIsTranslating(false);
-          alert('Failed to process audio');
-        }
-      };
-      
-      setAudioRecorder(recorder);
-      recorder.start();
-      
-      // Auto-stop after 10 seconds (adjust as needed)
-      setTimeout(() => {
-        if (recorder.state === 'recording') {
-          recorder.stop();
-          setIsCapturingAudio(false);
-        }
-      }, 10000);
-      
-    } catch (error) {
-      console.error('❌ Error starting translation:', error);
-      setIsCapturingAudio(false);
-      alert('Failed to start audio capture');
-    }
-  }, [translationLanguage]);
-
-  const stopTranslation = useCallback(() => {
-    if (audioRecorder && audioRecorder.state === 'recording') {
-      console.log('🛑 Stopping audio capture...');
-      audioRecorder.stop();
-      setIsCapturingAudio(false);
-    }
-  }, [audioRecorder]);
-
-  const toggleTranslation = useCallback(() => {
-    if (isCapturingAudio) {
-      stopTranslation();
-    } else {
-      startTranslation();
-    }
-  }, [isCapturingAudio, startTranslation, stopTranslation]);
 
   const clearTranscriptions = useCallback(() => {
     setTranscriptionResults([]);
@@ -1722,9 +1589,7 @@ function VideoCall() {
     setTtsSpeaking(false);
 
     // Stop continuous translation if active
-    if (continuousRecorderRef.current) {
-      stopContinuousTranslation();
-    }
+    stopContinuousTranslation();
     
     // Stop recording if active
     if (isRecording && mediaRecorderRef.current) {
@@ -2121,7 +1986,7 @@ function VideoCall() {
                         <div className="translation-status-active">
                           <p>🎤 Auto-Translate is ON</p>
                           <p className="status-detail">{translationStatus || 'Listening for speech...'}</p>
-                          <p className="status-hint">Speak clearly and wait 10-15 seconds</p>
+                          <p className="status-hint">Just speak — captions and translations appear live</p>
                         </div>
                       ) : (
                         <p>Click the Auto-Translate button to start</p>
