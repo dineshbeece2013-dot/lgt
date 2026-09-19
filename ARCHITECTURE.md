@@ -3,7 +3,7 @@
 Full-stack video conferencing with **100% browser-native live translation**.
 
 - **Speech-to-text:** Web Speech API (`SpeechRecognition`) — built into Chrome, Edge, Safari
-- **Translation:** Chrome built-in **on-device Translator API** — runs locally, no network calls
+- **Translation:** Chrome on-device Translator API (primary) + free MyMemory API fallback (no key required) — runs in the browser
 - **Text-to-speech:** browser `SpeechSynthesis`
 - **Server:** signaling + room management + transcript relay only — **no AI on the server, no API keys**
 
@@ -42,10 +42,10 @@ Full-stack video conferencing with **100% browser-native live translation**.
 
 1. **User speaks** — the browser's `SpeechRecognition` (continuous mode, `lang` = speaker's language) produces interim + final results. It auto-restarts after silence.
 2. **Final transcript** — the speaker's client collects every target language in the room (its own + each other participant's `translationLanguage`, via the `participants` list).
-3. **On-device translation** — for each unique target language, the client calls the Chrome built-in `Translator` API (instances cached per language pair). If a pair is unavailable, the original transcript is delivered as a fallback.
+3. **Translation** — for each unique target language, the client calls the Chrome built-in `Translator` API (instances cached per language pair). If the API or language pair is unavailable, a free no-key fallback (MyMemory) is used. Either way, the translated text is delivered.
 4. **Broadcast** — one `transcript-broadcast` event is emitted with `{ original, translations: { lang: text }, speakerName, speakerLanguage }`.
 5. **Server relay** — the server looks up the room and emits `participant-translation` to every *other* participant with the translation in *their* language. The speaker already shows their own transcript locally.
-6. **Display + speak** — listeners show the caption card in the Translations panel and speak it via `SpeechSynthesis` (queued; TTS can be toggled).
+6. **Display + speak** — listeners show the caption card in the Translations panel AND as live subtitles at the bottom of each video tile, and speak it via `SpeechSynthesis` (queued; TTS can be toggled).
 
 > WebRTC media (video/audio) flows peer-to-peer and is never relayed through the translation pipeline.
 
@@ -101,7 +101,7 @@ transcript-broadcast     speaker's transcript + translations map (relay only)
 update-language          change speaker/translation language mid-meeting
 
 Server → Client
-participant-translation  { original, translated, targetLanguage, targetLanguageName, speakerName }
+participant-translation  { original, translated, targetLanguage, targetLanguageName, speakerName, speakerId, speakerLanguageName }
 room-joined / user-joined / user-left / room-active / room-deleted
 offer / answer / ice-candidate / media-state (WebRTC signaling)
 new-chat-message / new-reaction / whiteboard-* / admin events
@@ -125,14 +125,14 @@ new-chat-message / new-reaction / whiteboard-* / admin events
 |---|---|---|---|
 | Video/audio calls | ✅ | ✅ | ✅ |
 | Speech recognition (captions) | ✅ | ✅* | ❌ |
-| On-device translation | ✅ 138+ | ❌ (falls back to original text) | ❌ |
+| On-device translation | ✅ 138+ | ❌ (free MyMemory fallback used) | ❌ (free MyMemory fallback used) |
 | Text-to-speech | ✅ | ✅ | ✅ |
 
 \* Safari's speech recognition support is limited; Chrome/Edge recommended.
 
 ## Future Enhancements
 
-- [ ] Fallback translation provider for browsers without the built-in Translator
+- [x] Fallback translation provider for browsers without the built-in Translator (MyMemory, free no-key)
 - [ ] Automatic language detection (`LanguageDetector` API) instead of explicit speaker language
 - [ ] Translation history export (PDF/CSV)
 - [ ] On-device translation model pre-download prompt before meetings

@@ -55,7 +55,13 @@ function VideoCall() {
   const [transcriptionResults, setTranscriptionResults] = useState([]);
   const [showTranscriptions, setShowTranscriptions] = useState(false);
   const speakerLanguageRef = useRef('en'); // always holds latest speaker language for recognition closure
-  const [translationStatus, setTranslationStatus] = useState(''); // Status message for the translation panel
+    const [translationStatus, setTranslationStatus] = useState(''); // Status message for the translation panel
+
+  // Live caption subtitles — shown at the bottom of each video tile like movie subtitles
+  // Map: speakerSocketId → { text, speakerName, sourceLanguageName, timestamp }
+  const [liveCaptions, setLiveCaptions] = useState(new Map());
+  const captionTimeoutsRef = useRef(new Map());
+
   
   // Noise suppression (Krisp-equivalent via RNNoise WASM)
   const {
@@ -221,7 +227,14 @@ function VideoCall() {
   const translatorCacheRef = useRef(new Map()); // "src>dst" → Translator instance (or null = unavailable)
   const translationLanguageRef = useRef('es');  // latest own translation language
   const participantsRef = useRef([]);           // latest participants (for target languages)
-  const handleFinalTranscriptRef = useRef(null);// latest transcript handler (avoids stale closures)
+    const handleFinalTranscriptRef = useRef(null);// latest transcript handler (avoids stale closures)
+
+  // — Continuous (interim) subtitle updates — refs to keep latest
+  // handlers reachable from the speech recognizer's event closures
+  const handleInterimTranscriptRef = useRef(null);
+  const interimDebounceRef = useRef(null); // throttle translation calls during rapid interim updates
+  const interimTextRef = useRef('');       // latest interim text (skip stale async results)
+  
 
   // Start meeting elapsed timer
   const startMeetingTimer = useCallback((room) => {
@@ -753,7 +766,17 @@ function VideoCall() {
         const updated = [...prev, newResult];
         return updated.length > 50 ? updated.slice(-50) : updated;
       });
-      setShowTranscriptions(true);
+            setShowTranscriptions(true);
+
+      // Set live subtitle on the correct remote video tile
+      if (data.speakerId) {
+        setLiveCaption(data.speakerId, {
+          text: data.translated,
+          original: data.original,
+          speakerName: data.speakerName,
+          sourceLanguageName: data.speakerLanguageName || getLanguageName(data.speakerLanguage)
+        });
+      }
 
       // Speak the translated text if TTS is enabled (use ref to avoid stale closure)
       if (ttsEnabledRef.current && data.translated) {
@@ -1144,6 +1167,71 @@ function VideoCall() {
   // Text-to-speech:      browser SpeechSynthesis (unchanged)
   // No server AI involved — the server only relays results to the room.
 
+    // ── Live caption helper ─────────────────────────────────────────────────
+  // Stores a subtitle for a given speaker and auto-clears it after CAPTION_TIMEOUT_MS.
+  const CAPTION_TIMEOUT_MS = 6000;
+  const setLiveCaption = useCallback((speakerId, data) => {
+    if (!speakerId) return;
+    setLiveCaptions(prev => {
+      const updated = new Map(prev);
+      if (data) {
+        updated.set(speakerId, data);
+      } else {
+        updated.delete(speakerId);
+      }
+      return updated;
+    });
+    // Clear any pending timeout for this speaker
+    if (captionTimeoutsRef.current.has(speakerId)) {
+      clearTimeout(captionTimeoutsRef.current.get(speakerId));
+    }
+    // Schedule auto-clear
+    if (data) {
+      const t = setTimeout(() => {
+        setLiveCaptions(prev => {
+          const updated = new Map(prev);
+          updated.delete(speakerId);
+          return updated;
+        });
+        captionTimeoutsRef.current.delete(speakerId);
+      }, CAPTION_TIMEOUT_MS);
+      captionTimeoutsRef.current.set(speakerId, t);
+    }
+  }, []);
+
+  // ── Browser-native on-device translation ─────────────────────────────────
+  // Tries Chrome's built-in Translator API first; falls back to a free
+  // no-key translation endpoint (MyMemory) so captions always translate
+  // even in browsers that lack the experimental Translator API.
+
+  // Free fallback: MyMemory Translation API (no API key required)
+  const translateViaFreeAPI = useCallback(async (text, source, target) => {
+    if (!text || source === target) return text;
+    try {
+      const params = new URLSearchParams({
+        q: text,
+        langpair: `${source}|${target}`,
+        de: 'lgt-video-call'
+      });
+      const response = await fetch(`https://api.mymemory.translated.net/get?${params}`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      // MyMemory returns 200 with the result in responseData.translatedText
+      const translated = data?.responseData?.translatedText;
+      if (translated && translated !== text) {
+        return translated;
+      }
+      // Some responses put results in a "matches" array
+      if (data?.matches && data.matches.length > 0) {
+        return data.matches[0].translation;
+      }
+      throw new Error('No translation returned');
+    } catch (err) {
+      console.warn(`⚠️ Free API translation ${source} → ${target} failed:`, err.message);
+      return null;
+    }
+  }, []);
+
   // Get (or create) an on-device Translator for a language pair
   const getTranslator = useCallback(async (source, target) => {
     const key = `${source}>${target}`;
@@ -1182,19 +1270,27 @@ function VideoCall() {
     return translator;
   }, []);
 
-  // Translate text on-device (Chrome built-in Translator). Never throws —
-  // falls back to the original text so captions keep flowing.
+    // Translate text — tries Chrome built-in Translator API first, then falls
+  // back to a free no-key translation endpoint (MyMemory). Never throws.
   const translateText = useCallback(async (text, source, target) => {
     if (!text || !text.trim() || source === target) return text;
     try {
+      // Try browser-native on-device translation first
       const translator = await getTranslator(source, target);
       const translated = await translator.translate(text);
       return translated || text;
     } catch (err) {
-      console.warn(`⚠️ Translation ${source} → ${target} failed:`, err.message);
-      return text; // fallback: deliver the original transcript
+      // Browser doesn't support Chrome Translator API — use free fallback
+      console.warn(`⚠️ On-device translation ${source} → ${target} unavailable, trying free API...`);
+      const translated = await translateViaFreeAPI(text, source, target);
+      if (translated) {
+        return translated;
+      }
+      // Ultimate fallback: return original text so captions keep flowing
+      setTranslationStatus(`⚠️ Translation unavailable (${source} → ${target})`);
+      return text;
     }
-  }, [getTranslator]);
+  }, [getTranslator, translateViaFreeAPI, setTranslationStatus]);
 
   // Handle a final transcript from the speech recognizer: show it locally,
   // translate it on-device into every participant's target language and
@@ -1223,11 +1319,12 @@ function VideoCall() {
 
     const timestamp = new Date().toLocaleTimeString();
 
-    // Show own transcript card (original + own translation)
+        // Show own transcript card (original + own translation)
+    const ownTranslation = translations[myTarget] ?? text;
     setTranscriptionResults(prev => [...prev.slice(-49), {
       id: `${Date.now()}-self-${Math.random().toString(36).slice(2, 7)}`,
       original: text,
-      translated: translations[myTarget] ?? text,
+      translated: ownTranslation,
       targetLanguage: myTarget,
       targetLanguageName: getLanguageName(myTarget),
       speakerName,
@@ -1235,6 +1332,14 @@ function VideoCall() {
       isFallback: false
     }]);
     setShowTranscriptions(true);
+
+    // Show live subtitle at the bottom of the local video tile
+    setLiveCaption(socketRef.current.id, {
+      text: ownTranslation,
+      original: text,
+      speakerName,
+      sourceLanguageName: getLanguageName(sourceLang)
+    });
 
     // Relay to the room — the server fans out per participant language
     socketRef.current.emit('transcript-broadcast', {
@@ -1247,10 +1352,67 @@ function VideoCall() {
     });
   }, [roomId, location.state, translateText]);
 
-  // Keep the latest handler reachable from the recognizer's event closures
+    // Keep the latest handler reachable from the recognizer's event closures
   useEffect(() => {
     handleFinalTranscriptRef.current = handleFinalTranscript;
   }, [handleFinalTranscript]);
+
+  // Handle INTERIM (partial) results: translate on-device and show as a
+  // continuously-updating subtitle on the local video tile — like movie
+  // captions that appear word-by-word as the speaker talks.  These are NOT
+  // broadcast to other participants (only final results are relayed).
+  const handleInterimTranscript = useCallback(async (text) => {
+    const trimmed = (text || '').trim();
+    if (!trimmed || !socketRef.current?.id) return;
+
+    interimTextRef.current = trimmed;
+
+    // Throttle: wait for a brief pause in the rapid interim stream before
+    // committing a translation, so we don't spam the translation API.
+    if (interimDebounceRef.current) {
+      clearTimeout(interimDebounceRef.current);
+    }
+
+    interimDebounceRef.current = setTimeout(async () => {
+      const currentText = interimTextRef.current;
+      if (!currentText) return;
+
+      const sourceLang = speakerLanguageRef.current || 'en';
+      const myTarget = translationLanguageRef.current || 'en';
+      const speakerName = location.state?.participantName || 'Unknown';
+
+      // 1) Show original text immediately so the user sees instant feedback
+      setLiveCaption(socketRef.current.id, {
+        text: myTarget === sourceLang ? currentText : currentText,
+        original: currentText,
+        speakerName,
+        sourceLanguageName: getLanguageName(sourceLang),
+        isInterim: true
+      });
+
+      // 2) Translate (on-device first, MyMemory fallback) and update subtitle
+      if (myTarget !== sourceLang) {
+        const translated = await translateText(currentText, sourceLang, myTarget);
+        // Only apply if this is still the latest interim text (not stale)
+        if (interimTextRef.current === currentText) {
+          setLiveCaption(socketRef.current.id, {
+            text: translated,
+            original: currentText,
+            speakerName,
+            sourceLanguageName: getLanguageName(sourceLang),
+            isInterim: true
+          });
+        }
+      }
+    }, 200);
+  }, [translateText, location.state]);
+
+  // Keep the latest interim handler reachable from the recognizer's closures
+  useEffect(() => {
+    handleInterimTranscriptRef.current = handleInterimTranscript;
+  }, [handleInterimTranscript]);
+
+
 
   // Continuous live translation — browser speech recognition
   const startContinuousTranslation = useCallback(() => {
@@ -1289,10 +1451,12 @@ function VideoCall() {
 
     recognition.onresult = (event) => {
       let interim = '';
+      let hasFinal = false;
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const result = event.results[i];
         const transcript = (result[0]?.transcript || '').trim();
         if (result.isFinal) {
+          hasFinal = true;
           if (transcript && handleFinalTranscriptRef.current) {
             handleFinalTranscriptRef.current(transcript);
           }
@@ -1300,7 +1464,16 @@ function VideoCall() {
           interim = transcript;
         }
       }
-      setTranslationStatus(interim ? `🎤 “...${interim.slice(-60)}”` : '🎤 Listening...');
+      // Interim results: continuously translate and show as subtitles
+      // (no broadcast to others, just updates the local video tile)
+      if (!hasFinal && interim && handleInterimTranscriptRef.current) {
+        handleInterimTranscriptRef.current(interim);
+      }
+      if (interim) {
+        setTranslationStatus(`🎤 “...${interim.slice(-60)}”`);
+      } else if (!hasFinal) {
+        setTranslationStatus(`🎤 Listening...`);
+      }
     };
 
     recognition.onerror = (event) => {
@@ -1588,8 +1761,18 @@ function VideoCall() {
     ttsSpeakingRef.current = false;
     setTtsSpeaking(false);
 
-    // Stop continuous translation if active
+        // Stop continuous translation if active
     stopContinuousTranslation();
+
+                  // Clear live caption timeouts
+    captionTimeoutsRef.current.forEach(timeout => clearTimeout(timeout));
+    captionTimeoutsRef.current.clear();
+    setLiveCaptions(new Map());
+    // Clear any pending interim debounce timer
+    if (interimDebounceRef.current) {
+      clearTimeout(interimDebounceRef.current);
+      interimDebounceRef.current = null;
+    }
     
     // Stop recording if active
     if (isRecording && mediaRecorderRef.current) {
@@ -1756,10 +1939,18 @@ function VideoCall() {
               >
                 {isAudioEnabled ? '🎤' : '🎤❌'}
               </button>
-            </div>
+                        </div>
+            {liveCaptions.has(socketRef.current?.id) && (
+              <div className={`subtitle-overlay local${liveCaptions.get(socketRef.current?.id)?.isInterim ? ' interim' : ''}`}>
+                {liveCaptions.get(socketRef.current?.id)?.original && (
+                  <div className="subtitle-original">{liveCaptions.get(socketRef.current?.id).original}</div>
+                )}
+                <div className="subtitle-text">{liveCaptions.get(socketRef.current?.id).text}</div>
+              </div>
+            )}
           </div>
 
-          {/* Remote videos - ONLY render actual participants with valid data */}
+                    {/* Remote videos - ONLY render actual participants with valid data */}
           {participants
             .filter(participant => participant && participant.id && participant.name)
             .map((participant, index) => {
@@ -1774,7 +1965,8 @@ function VideoCall() {
                   raisedHands={raisedHands}
                   translationActive={translationEnabled}
                   ttsEnabled={ttsEnabled}
-                  globalMuteOriginal={muteOriginalAudio}
+                                  globalMuteOriginal={muteOriginalAudio}
+                  liveCaption={liveCaptions.get(participant.id)}
                 />
               );
             })}
@@ -2320,7 +2512,7 @@ function VideoCall() {
 }
 
 // Separate component for remote video to ensure proper re-rendering
-const RemoteVideo = React.memo(({ participant, stream, index, raisedHands, translationActive, ttsEnabled, globalMuteOriginal }) => {
+const RemoteVideo = React.memo(({ participant, stream, index, raisedHands, translationActive, ttsEnabled, globalMuteOriginal, liveCaption }) => {
   const videoRef = useRef();
   const [isStreamActive, setIsStreamActive] = useState(false);
   // Per-video override: user can flip back to original for this specific participant
@@ -2427,7 +2619,16 @@ const RemoteVideo = React.memo(({ participant, stream, index, raisedHands, trans
         {connectionStatus === 'connected' && isStreamActive && (
           <span className="status-icon connected">🟢</span>
         )}
-      </div>
+            </div>
+
+      {liveCaption && (
+        <div className={`subtitle-overlay remote${liveCaption?.isInterim ? ' interim' : ''}`}>
+          {liveCaption.original && (
+            <div className="subtitle-original">{liveCaption.original}</div>
+          )}
+          <div className="subtitle-text">{liveCaption.text}</div>
+        </div>
+            )}
     </div>
   );
 });

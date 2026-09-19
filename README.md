@@ -2,12 +2,12 @@
 
 A full-stack video conferencing web app with **real-time speech translation**, built with React and Node.js.
 
-Participants join a room over **WebRTC** peer-to-peer video/audio. Live translation is **100% browser-native**: speech recognition uses the built-in **Web Speech API**, translation uses Chrome's built-in **on-device Translator API**, and spoken playback uses the browser's speech synthesis — **no API keys, no server-side AI, no per-minute cloud costs**.
+Participants join a room over **WebRTC** peer-to-peer video/audio. Live translation pipeline: speech recognition uses the built-in **Web Speech API** → on-screen subtitles appear at the **bottom of every video tile** like movie captions → text is translated in-browser via Chrome's **on-device Translator API** with a **free no-key fallback** (MyMemory) when the browser doesn't support it → spoken playback uses the browser's **speech synthesis**. **No Groq API keys, no server-side AI, no per-minute cloud costs**.
 
 ## Features
 
 - 🎥 HD video calls (WebRTC peer-to-peer, admin/participant roles)
-- 🌐 Real-time speech translation with voice output (browser-native, no API keys)
+- 🌐 Real-time speech translation with live subtitles at the bottom of every video tile (browser-native Web Speech API → on-device/native translation → speech synthesis)
 - 🎙️ AI noise suppression (RNNoise via WebAssembly)
 - 👑 Admin controls — remove participants, end meeting for everyone
 - 💬 In-meeting chat, emoji reactions, raised hands
@@ -22,7 +22,7 @@ Participants join a room over **WebRTC** peer-to-peer video/audio. Live translat
 | Client | React 19 (Create React App), React Router 6, Socket.IO client, WebRTC, Web Speech API, Chrome built-in Translator API, @jitsi/rnnoise-wasm |
 | Server | Node.js (ESM), Express 5, Socket.IO 4 — signaling/relay only, no AI dependencies |
 | Speech → text | Browser Web Speech API (`SpeechRecognition`) — built into Chrome/Edge/Safari |
-| Translation | Chrome built-in on-device Translator API (no network calls, no API keys) |
+| Translation | Chrome on-device Translator API (primary) + free MyMemory API fallback (no key) |
 | Deployment (optional) | Docker Compose, Render (`render.yaml`) |
 
 ## Project Structure
@@ -51,7 +51,7 @@ lgt/
 - **Node.js 18+** (20 LTS recommended) — https://nodejs.org
 - **npm 9+** (ships with Node)
 - **No API keys required** — speech recognition and translation run in the browser.
-- **Browser support:** speech recognition (STT) works in Chrome, Edge and Safari; **translation additionally requires Chrome or Edge 138+** (built-in on-device Translator API). In unsupported browsers, live captions still show but are not translated.
+- **Browser support:** speech recognition (STT) works in Chrome, Edge and Safari; **translation additionally requires Chrome or Edge 138+** (built-in on-device Translator API). **In browsers that lack the Translator API, a free no-key fallback (MyMemory) is used automatically** so subtitles always translate. In all browsers, live captions (original + translated) appear at the bottom of every video tile.**
 - A webcam + microphone.
 
 ---
@@ -179,7 +179,7 @@ npx serve -s ../client/build -l 3000
 |---|---|
 | `Port 5001 already in use` | Stop the other process or set `PORT` in `server/.env`, then update `client/src/config.js` |
 | "Speech recognition not supported" | Use Chrome, Edge or Safari — Firefox doesn't implement the Web Speech API |
-| Captions appear but aren't translated | The on-device Translator model needs **Chrome/Edge 138+**; open `chrome://on-device-translation` and install the language pair, or switch browsers |
+| Captions appear but aren't translated | Translation tries the Chrome on-device Translator API first, then falls back to a free MyMemory endpoint. Check the browser console for `Translation … failed` warnings — some rare language pairs may not be available on either service. Use a Chromium browser for best results  
 | Camera/mic not working | Grant browser permissions; use `localhost` or HTTPS |
 | `Room not found` when joining | Rooms live in server memory (plus a temp-file cache); make sure the same server instance is running |
 | Client can't reach server | Check the URLs logged in the browser console by `client/src/config.js` |

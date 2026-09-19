@@ -316,7 +316,7 @@ io.on("connection", socket => {
       const translated =
         (translations && typeof translations[targetLang] === 'string' && translations[targetLang]) || text;
 
-      const participantSocket = io.sockets.sockets.get(participant.id);
+            const participantSocket = io.sockets.sockets.get(participant.id);
       if (participantSocket) {
         participantSocket.emit('participant-translation', {
           original: text,
@@ -324,7 +324,9 @@ io.on("connection", socket => {
           targetLanguage: targetLang,
           targetLanguageName: LANGUAGE_NAMES[targetLang] || targetLang,
           speakerName: name,
-          speakerLanguage: speakerLanguage || null
+          speakerLanguage: speakerLanguage || null,
+          speakerId: socket.id,                               // so listeners can match to the right video tile
+          speakerLanguageName: LANGUAGE_NAMES[speakerLanguage] || speakerLanguage   // human-readable source language
         });
       }
     });
